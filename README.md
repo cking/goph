@@ -39,6 +39,7 @@ You can find the docs at [go docs](https://pkg.go.dev/github.com/melbahja/goph).
 - Supports adding new hosts to **known_hosts file**.
 - Supports **file system operations** like: `Open, Create, Chmod...`
 - Supports **context.Context** for command cancellation.
+- Supports **bastion hosts**.
 
 ## 📄&nbsp; Usage
 

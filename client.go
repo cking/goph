@@ -5,6 +5,7 @@ package goph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,11 +19,12 @@ import (
 // Client represents Goph client.
 type Client struct {
 	*ssh.Client
-	Config *Config
+	BastionClient *ssh.Client
+	Config        *Config
 }
 
-// Config for Client.
-type Config struct {
+// BaseConfig for Client.
+type BaseConfig struct {
 	Auth           Auth
 	User           string
 	Addr           string
@@ -30,6 +32,12 @@ type Config struct {
 	Timeout        time.Duration
 	Callback       ssh.HostKeyCallback
 	BannerCallback ssh.BannerCallback
+}
+
+// Config for Client.
+type Config struct {
+	BaseConfig
+	Bastion *BaseConfig
 }
 
 // DefaultTimeout is the timeout of ssh client connection.
@@ -45,12 +53,14 @@ func New(user string, addr string, auth Auth) (c *Client, err error) {
 	}
 
 	c, err = NewConn(&Config{
-		User:     user,
-		Addr:     addr,
-		Port:     22,
-		Auth:     auth,
-		Timeout:  DefaultTimeout,
-		Callback: callback,
+		BaseConfig: BaseConfig{
+			User:     user,
+			Addr:     addr,
+			Port:     22,
+			Auth:     auth,
+			Timeout:  DefaultTimeout,
+			Callback: callback,
+		},
 	})
 	return
 }
@@ -61,24 +71,81 @@ func New(user string, addr string, auth Auth) (c *Client, err error) {
 // You can add the key to know hosts and use New() func instead!
 func NewUnknown(user string, addr string, auth Auth) (*Client, error) {
 	return NewConn(&Config{
-		User:     user,
-		Addr:     addr,
-		Port:     22,
-		Auth:     auth,
-		Timeout:  DefaultTimeout,
-		Callback: ssh.InsecureIgnoreHostKey(),
+		BaseConfig: BaseConfig{
+			User:     user,
+			Addr:     addr,
+			Port:     22,
+			Auth:     auth,
+			Timeout:  DefaultTimeout,
+			Callback: ssh.InsecureIgnoreHostKey(),
+		},
 	})
 }
 
 // NewConn returns new client and error if any.
 func NewConn(config *Config) (c *Client, err error) {
-
 	c = &Client{
 		Config: config,
 	}
 
-	c.Client, err = Dial("tcp", config)
+	if config.Bastion != nil {
+		c.Client, c.BastionClient, err = DialWithBastion("tcp", config)
+	} else {
+		c.Client, err = Dial("tcp", config)
+	}
+
 	return
+}
+
+// DialWithBastion starts a client connection to SSH server  based on config.
+func DialWithBastion(proto string, c *Config) (*ssh.Client, *ssh.Client, error) {
+	bastionCfg := c.Bastion
+	if bastionCfg.Callback == nil {
+		bastionCfg.Callback = c.Callback
+	}
+	if bastionCfg.BannerCallback == nil {
+		bastionCfg.BannerCallback = c.BannerCallback
+	}
+	if bastionCfg.Timeout == 0 {
+		bastionCfg.Timeout = c.Timeout
+	}
+	if bastionCfg.Port == 0 {
+		bastionCfg.Port = c.Port
+	}
+	if bastionCfg.Auth == nil {
+		bastionCfg.Auth = c.Auth
+	}
+
+	bastion, err := ssh.Dial(proto, net.JoinHostPort(c.Bastion.Addr, fmt.Sprint(c.Bastion.Port)), &ssh.ClientConfig{
+		User:            c.Bastion.User,
+		Auth:            c.Bastion.Auth,
+		Timeout:         c.Bastion.Timeout,
+		HostKeyCallback: c.Bastion.Callback,
+		BannerCallback:  c.Bastion.BannerCallback,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	targetConn, err := bastion.Dial("tcp", net.JoinHostPort(c.Addr, fmt.Sprint(c.Port)))
+	if err != nil {
+		_ = bastion.Close()
+		return nil, nil, err
+	}
+
+	ta, chans, reqs, err := ssh.NewClientConn(targetConn, net.JoinHostPort(c.Addr, fmt.Sprint(c.Port)), &ssh.ClientConfig{
+		User:            c.User,
+		Auth:            c.Auth,
+		Timeout:         c.Timeout,
+		HostKeyCallback: c.Callback,
+		BannerCallback:  c.BannerCallback,
+	})
+	if err != nil {
+		_ = bastion.Close()
+		return nil, nil, err
+	}
+
+	return ssh.NewClient(ta, chans, reqs), bastion, nil
 }
 
 // Dial starts a client connection to SSH server based on config.
@@ -157,8 +224,26 @@ func (c Client) NewSftp(opts ...sftp.ClientOption) (*sftp.Client, error) {
 }
 
 // Close client net connection.
-func (c Client) Close() error {
-	return c.Client.Close()
+func (c Client) Close() (err error) {
+	defer func(cl *ssh.Client) {
+		if cl != nil {
+			bastionErr := cl.Close()
+			if bastionErr != nil {
+				err = errors.Join(bastionErr, err)
+			}
+		}
+	}(c.BastionClient)
+
+	err = c.Client.Close()
+	if err != nil {
+		return err
+	}
+
+	if c.BastionClient != nil {
+		return c.BastionClient.Close()
+	}
+
+	return nil
 }
 
 // Upload a local file to remote server!
